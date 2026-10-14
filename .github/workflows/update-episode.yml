@@ -42,11 +42,19 @@ jobs:
           path: ~/.cache/huggingface
           key: whisper-small
 
+      # Lokale KI (Ollama) fuer die Zitat-Auswahl zwischenspeichern
+      - uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen2.5-3b
+
       - name: Auf neue Folge pruefen & Seite aktualisieren
         id: run
         env:
           PODCAST_RSS: ${{ vars.PODCAST_RSS }}
           FORCE_QUOTE: ${{ inputs.neues_zitat }}
+          LOCAL_LLM: "1"
+          OLLAMA_MODELS: /home/runner/.ollama/models
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           YT_PROXY_URL: ${{ secrets.YT_PROXY_URL }}

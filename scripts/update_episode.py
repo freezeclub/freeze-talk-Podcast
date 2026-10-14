@@ -11,8 +11,8 @@ Zitat-Quellen (in dieser Reihenfolge, alles ohne API-Key möglich):
   2. Audio aus dem öffentlichen Podcast-RSS-Feed (PODCAST_RSS_DEFAULT bzw.
      PODCAST_RSS, notfalls Apple-Suche) → lokal mit Whisper abgeschrieben. Kein Key nötig.
   3. Optional: Gemini schaut sich das YouTube-Video direkt an (GEMINI_API_KEY).
-Die Auswahl des Satzes macht – ohne Key – eine Heuristik; mit ANTHROPIC_API_KEY
-oder GEMINI_API_KEY eine KI.
+Die Auswahl des Satzes: Vorauswahl per Heuristik, dann wählt eine kleine lokale KI
+(Ollama, LOCAL_LLM=1) – kostenlos und ohne Key. Optional Claude/Gemini per Key.
 
 Env:
   PODCAST_RSS         optional – überschreibt den RSS-Feed des Podcasts
@@ -318,8 +318,13 @@ def _quote_score(s, KW):
         score -= 1
     return score
 
-def heuristic_quote(transcript, ep=None):
-    """Kostenlose Auswahl ganz ohne KI: bester klarer Aussagesatz aus dem Transkript."""
+def _clean(q):
+    q = FILLERS.sub("", q)
+    q = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s+", " ", q)).strip()
+    return q[0].upper() + q[1:] if q else q
+
+def quote_candidates(transcript, ep=None, n=20):
+    """Vorauswahl ohne KI: die n besten klaren Aussagesätze aus dem Transkript."""
     t = re.sub(r"\[[^\]]*\]", " ", transcript)       # [gelächter] u.ä. entfernen
     t = re.sub(r"\s+", " ", t)
     KW = ["training", "gesünd", "gesund", "körper", "ernährung", "regeneration", "stress",
@@ -333,16 +338,82 @@ def heuristic_quote(transcript, ep=None):
     for s in re.split(r"(?<=[.!?])\s+", t):
         s = s.strip()
         sc = _quote_score(s, KW)
-        if sc is not None and sc >= 4:       # Mindest-Score – sonst lieber kein Zitat
+        if sc is not None and sc >= 2:
             cands.append((sc, s))
     cands.sort(key=lambda c: -c[0])
-    for sc, s in cands[:5]:
-        log(f"  Zitat-Kandidat ({sc}): {s}")
-    if not cands:
+    return [s for _, s in cands[:n]]
+
+def heuristic_quote(transcript, ep=None):
+    cands = quote_candidates(transcript, ep, n=5)
+    for c in cands:
+        log("  Zitat-Kandidat:", c)
+    return _clean(cands[0]) if cands else None
+
+# ---------- Lokale KI (Ollama, läuft im GitHub-Runner – kostenlos, ohne Key) ----------
+
+LOCAL_LLM = os.environ.get("LOCAL_LLM_MODEL", "qwen2.5:3b")
+
+def _ollama_ready():
+    import shutil, subprocess, time
+    if os.environ.get("LOCAL_LLM") != "1":
+        return False
+    try:
+        if not shutil.which("ollama"):
+            log("Installiere Ollama …")
+            subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True,
+                           stdout=subprocess.DEVNULL)
+        try:
+            urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=3)
+        except Exception:
+            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=3); break
+                except Exception:
+                    pass
+        subprocess.run(["ollama", "pull", LOCAL_LLM], check=True, stdout=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        log("Lokale KI nicht verfügbar:", e); return False
+
+def _overlap(a, b):
+    wa, wb = set(_norm(a).split()), set(_norm(b).split())
+    return len(wa & wb) / max(1, len(wa))
+
+def local_llm_quote(transcript, ep):
+    cands = quote_candidates(transcript, ep, n=20)
+    if not cands or not _ollama_ready():
         return None
-    best = FILLERS.sub("", cands[0][1])
-    best = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s+", " ", best)).strip()
-    return best[0].upper() + best[1:]
+    listing = "\n".join(f"{i+1}. {c}" for i, c in enumerate(cands))
+    prompt = (
+        "Du bist Redakteur für den deutschen Gesundheits-Podcast 'freeze & talk'. "
+        f"Folge: '{ep['title']}' mit {ep['guest'] or 'einem Gast'}.\n"
+        "Unten stehen Sätze aus dem automatischen Transkript. Wähle den EINEN Satz, der als "
+        "Zitat auf der Webseite am stärksten ist: eine klare, in sich verständliche Kernaussage "
+        "zum Thema der Folge, ohne Gesprächsbezug ('wie gesagt', 'am Anfang'), keine Anekdote.\n"
+        "Glätte ihn behutsam (Füllwörter weg, Grammatik/Satzzeichen korrigieren), aber erfinde "
+        "nichts und ändere die Aussage nicht.\n"
+        'Antworte NUR mit JSON: {"nr": <Nummer>, "quote": "<geglätteter Satz>"}\n\n' + listing
+    )
+    body = json.dumps({"model": LOCAL_LLM, "prompt": prompt, "stream": False, "format": "json",
+                       "options": {"temperature": 0.2}}).encode()
+    try:
+        req = urllib.request.Request("http://127.0.0.1:11434/api/generate", data=body,
+                                     headers={"content-type": "application/json"})
+        resp = json.loads(urllib.request.urlopen(req, timeout=900).read())
+        out = json.loads(resp.get("response", "{}"))
+        nr = int(out.get("nr", 0))
+        if not 1 <= nr <= len(cands):
+            return None
+        orig, q = cands[nr - 1], (out.get("quote") or "").strip().strip('"„“”')
+        log(f"Lokale KI wählt #{nr}: {orig}")
+        # Sicherheitsnetz: geglättete Fassung nur, wenn sie inhaltlich beim Original bleibt
+        if q and 40 <= len(q) <= 180 and _overlap(q, orig) >= 0.8:
+            return q
+        return _clean(orig)
+    except Exception as e:
+        log("Lokale KI Fehler:", e); return None
 
 def pick_quote(vid, ep):
     transcript = get_transcript(vid)
@@ -363,7 +434,10 @@ def pick_quote(vid, ep):
         q = _gemini_quote(transcript, ep)
         if q:
             return q
-    return heuristic_quote(transcript, ep)  # gratis, ohne Key
+    q = local_llm_quote(transcript, ep)   # gratis, ohne Key – läuft im Runner
+    if q:
+        return q
+    return heuristic_quote(transcript, ep)
 
 def sub1(pattern, repl, text, flags=0):
     new, n = re.subn(pattern, repl, text, count=1, flags=flags)
