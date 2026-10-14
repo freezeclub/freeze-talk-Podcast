@@ -292,6 +292,32 @@ def _gemini_video_quote(vid, ep):
 
 FILLERS = re.compile(r"\b([Ää]hm?|halt|sozusagen|quasi|gell|ne)\b[,]?\s*", re.I)
 
+# Gesprächs-/Meta-Floskeln: solche Sätze funktionieren ohne Kontext nicht als Zitat
+META = ["gesagt", "am anfang", "vorhin", "erzählt", "erzähl", "folge", "podcast", "frage",
+        "heute", "gerade", "eben", "nochmal", "noch mal", "wie gesagt", "zuhörer", "kamera",
+        "freent", "frezen", "blabla", "carlos", "insta", "danke", "willkommen", "schön, dass"]
+
+def _quote_score(s, KW):
+    low = s.lower()
+    if not (60 <= len(s) <= 165) or s.endswith("?"):
+        return None
+    if any(g in low for g in META):
+        return None
+    if re.match(r"^(Also|Ja|Aber|Genau|Und|Weil|Ähm|Ne|So|Oder|Dann|Da|Das heißt)\b", s):
+        return None
+    score = sum(2 for kw in set(KW) if kw in low)
+    if re.search(r"\b(ist|sind|kann|können|sollte|muss|müssen|bedeutet|braucht|heißt)\b", low):
+        score += 1
+    if re.search(r"\b(du|dein|deine|dich|dir|wir|unser|man|jeder)\b", low):
+        score += 2                           # allgemeingültig, spricht den Hörer an
+    if re.search(r"\bwenn\b.*\b(dann|wird|bleibt|kann|ist)\b", low):
+        score += 2                           # Wenn-dann-Aussage = gute Kernbotschaft
+    if re.search(r"\b(ich|mir|mich|mein)\b", low):
+        score -= 2                           # persönliche Anekdote, eher kein Zitat
+    if re.search(r"\b(halt|irgendwie|sozusagen|quasi|eigentlich)\b", low):
+        score -= 1
+    return score
+
 def heuristic_quote(transcript, ep=None):
     """Kostenlose Auswahl ganz ohne KI: bester klarer Aussagesatz aus dem Transkript."""
     t = re.sub(r"\[[^\]]*\]", " ", transcript)       # [gelächter] u.ä. entfernen
@@ -300,26 +326,21 @@ def heuristic_quote(transcript, ep=None):
           "schlaf", "bewegung", "kraft", "mental", "alltag", "respekt", "ziel", "muskel",
           "verletzung", "balance", "energie", "erholung", "atem", "atmen", "atmung",
           "gehirn", "nerven", "kälte", "fasten", "immun", "angst", "ruhe", "gesundheit"]
-    if ep:  # Wörter aus dem Folgentitel zählen mit – so passt das Zitat zum Thema
-        KW += [w for w in _norm(ep["title"]).split() if len(w) > 4]
-    best, best_score = None, 2   # Mindest-Score – sonst lieber kein Zitat
+    if ep:  # Wörter aus dem Folgentitel zählen doppelt – so passt das Zitat zum Thema
+        tw = [w[:-1] if len(w) > 6 else w for w in _norm(ep["title"]).split() if len(w) > 4]
+        KW += tw + tw
+    cands = []
     for s in re.split(r"(?<=[.!?])\s+", t):
         s = s.strip()
-        if not (60 <= len(s) <= 165) or s.endswith("?"):
-            continue
-        low = s.lower()
-        if any(g in low for g in ["freent", "frezen", "blabla", "carlos", "insta"]):
-            continue
-        if re.match(r"^(Also|Ja|Aber|Genau|Und|Weil|Ähm|Ne|So )\b", s):
-            continue
-        score = sum(2 for kw in KW if kw in low)
-        if re.search(r"\b(ist|kann|sollte|muss|bedeutet|geht darum)\b", low):
-            score += 1
-        if score > best_score:
-            best, best_score = s, score
-    if not best:
+        sc = _quote_score(s, KW)
+        if sc is not None and sc >= 4:       # Mindest-Score – sonst lieber kein Zitat
+            cands.append((sc, s))
+    cands.sort(key=lambda c: -c[0])
+    for sc, s in cands[:5]:
+        log(f"  Zitat-Kandidat ({sc}): {s}")
+    if not cands:
         return None
-    best = FILLERS.sub("", best)
+    best = FILLERS.sub("", cands[0][1])
     best = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s+", " ", best)).strip()
     return best[0].upper() + best[1:]
 
@@ -404,7 +425,7 @@ def main():
         # Lauf noch kein Transkript gab und es jetzt verfügbar ist.
         cm = re.search(r'<cite>[\s\S]*?Folge\s*#?(\d+)\s*</cite>', doc)
         cite_num = cm.group(1) if cm else None
-        if cite_num != p["num"]:
+        if cite_num != p["num"] or os.environ.get("FORCE_QUOTE") == "true":
             q = pick_quote(current_id, p)
             if q:
                 doc = set_quote(doc, q, p["guest"], p["num"])

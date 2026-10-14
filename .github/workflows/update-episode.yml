@@ -6,7 +6,12 @@ on:
   schedule:
     - cron: "0 13 * * *"   # taeglich 13:00 UTC = 14-15 Uhr DE
     - cron: "0 18 * * 2"   # zusaetzlich Dienstagabend 18:00 UTC = 19-20 Uhr DE
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      neues_zitat:
+        description: "Zitat der aktuellen Folge neu auswaehlen"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -41,6 +46,7 @@ jobs:
         id: run
         env:
           PODCAST_RSS: ${{ vars.PODCAST_RSS }}
+          FORCE_QUOTE: ${{ inputs.neues_zitat }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           YT_PROXY_URL: ${{ secrets.YT_PROXY_URL }}
