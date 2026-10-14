@@ -20,6 +20,7 @@ Env:
   GEMINI_API_KEY      optional – Zitat direkt aus dem Video
   ANTHROPIC_API_KEY   optional – Claude wählt das Zitat aus dem Transkript
   YT_PROXY_URL        optional – Proxy für den Transkript-Abruf (http://user:pass@host:port)
+  MANUAL_QUOTE        optional – setzt genau dieses Zitat für die aktuelle Folge
   SIMULATE_CURRENT_ID optional – überschreibt die "aktuelle" Hero-ID (nur Test)
   DRY_RUN=1           optional – schreibt index.html nicht, nur Log/Diff-Info
 
@@ -365,6 +366,9 @@ def _ollama_ready():
             log("Installiere Ollama …")
             subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True,
                            stdout=subprocess.DEVNULL)
+            # Der Installer startet einen System-Dienst mit eigenem Modell-Ordner – stoppen,
+            # damit unser Server OLLAMA_MODELS (gecacht) nutzt.
+            subprocess.run("sudo systemctl stop ollama", shell=True, stderr=subprocess.DEVNULL)
         try:
             urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=3)
         except Exception:
@@ -498,6 +502,13 @@ def main():
     m = re.search(r'<a class="video" href="https://www\.youtube\.com/watch\?v=([\w-]+)"', doc)
     current_id = os.environ.get("SIMULATE_CURRENT_ID") or (m.group(1) if m else None)
     log("Aktuelle Hero-ID:", current_id)
+
+    manual = (os.environ.get("MANUAL_QUOTE") or "").strip().strip('"„“”')
+    if manual:
+        # Zitat von Hand (Workflow-Eingabe „zitat“) für die aktuelle Folge im Hero
+        doc = set_quote(doc, manual, p["guest"], p["num"]) if current_id == ep["id"] else doc
+        finalize(doc, current_id, f"Zitat von Hand gesetzt für Folge #{p['num']}")
+        return
 
     if current_id == ep["id"]:
         # Keine neue Folge – aber evtl. Zitat nachziehen, falls es beim ersten
