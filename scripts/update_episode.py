@@ -232,8 +232,8 @@ def audio_transcript(ep):
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=300) as r, open(src, "wb") as f:
             f.write(r.read())
-        # Intro überspringen, ~20 Minuten reichen für ein gutes Zitat und halten den Lauf kurz.
-        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", "120", "-t", "1200",
+        # Intro überspringen, ~35 Minuten reichen für ein gutes Zitat und halten den Lauf überschaubar.
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", "120", "-t", "2100",
                         "-i", src, "-ac", "1", "-ar", "16000", wav], check=True)
         model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
         # WAV selbst einlesen statt über PyAV (Versionskonflikte bei neuen PyAV-Releases)
@@ -334,14 +334,17 @@ def quote_candidates(transcript, ep=None, n=20):
     if ep:  # Wörter aus dem Folgentitel zählen doppelt – so passt das Zitat zum Thema
         tw = [w[:-1] if len(w) > 6 else w for w in _norm(ep["title"]).split() if len(w) > 4]
         KW += tw + tw
+    title_kw = [w[:-1] if len(w) > 6 else w for w in _norm(ep["title"]).split() if len(w) > 4] if ep else []
     cands = []
     for s in re.split(r"(?<=[.!?])\s+", t):
         s = s.strip()
         sc = _quote_score(s, KW)
         if sc is not None and sc >= 2:
-            cands.append((sc, s))
-    cands.sort(key=lambda c: -c[0])
-    return [s for _, s in cands[:n]]
+            on_topic = any(w in s.lower() for w in title_kw)
+            cands.append((on_topic, sc, s))
+    # Sätze, die ein Wort aus dem Folgentitel enthalten, kommen zuerst – so bleibt es beim Thema
+    cands.sort(key=lambda c: (not c[0], -c[1]))
+    return [s for _, _, s in cands[:n]]
 
 def heuristic_quote(transcript, ep=None):
     cands = quote_candidates(transcript, ep, n=5)
@@ -351,7 +354,7 @@ def heuristic_quote(transcript, ep=None):
 
 # ---------- Lokale KI (Ollama, läuft im GitHub-Runner – kostenlos, ohne Key) ----------
 
-LOCAL_LLM = os.environ.get("LOCAL_LLM_MODEL", "qwen2.5:3b")
+LOCAL_LLM = os.environ.get("LOCAL_LLM_MODEL", "qwen2.5:7b")
 
 def _ollama_ready():
     import shutil, subprocess, time
@@ -386,12 +389,14 @@ def local_llm_quote(transcript, ep):
     if not cands or not _ollama_ready():
         return None
     listing = "\n".join(f"{i+1}. {c}" for i, c in enumerate(cands))
+    log("Zitat-Kandidaten für die KI:\n" + listing)
     prompt = (
         "Du bist Redakteur für den deutschen Gesundheits-Podcast 'freeze & talk'. "
         f"Folge: '{ep['title']}' mit {ep['guest'] or 'einem Gast'}.\n"
         "Unten stehen Sätze aus dem automatischen Transkript. Wähle den EINEN Satz, der als "
         "Zitat auf der Webseite am stärksten ist: eine klare, in sich verständliche Kernaussage "
-        "zum Thema der Folge, ohne Gesprächsbezug ('wie gesagt', 'am Anfang'), keine Anekdote.\n"
+        "die direkt zum Thema der Folge (siehe Titel) passt und Hörern einen Aha-Moment gibt; "
+        "ohne Gesprächsbezug ('wie gesagt', 'am Anfang'), keine Anekdote, nichts über Beruf/Ausbildung.\n"
         "Glätte ihn behutsam (Füllwörter weg, Grammatik/Satzzeichen korrigieren), aber erfinde "
         "nichts und ändere die Aussage nicht.\n"
         'Antworte NUR mit JSON: {"nr": <Nummer>, "quote": "<geglätteter Satz>"}\n\n' + listing
