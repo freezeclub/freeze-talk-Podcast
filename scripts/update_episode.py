@@ -164,30 +164,27 @@ def _anthropic_quote(transcript, ep):
 def _norm(s):
     return re.sub(r"[^a-z0-9äöüß]+", " ", html.unescape(s or "").lower()).strip()
 
-def podcast_rss_url():
+def podcast_rss_urls():
+    """Kandidaten-Feeds: PODCAST_RSS oder alle Apple-Podcasts-Treffer mit 'freeze' im Namen."""
     if os.environ.get("PODCAST_RSS"):
-        return os.environ["PODCAST_RSS"]
-    try:
-        data = json.loads(fetch("https://itunes.apple.com/search?media=podcast&country=DE"
-                                "&term=freeze%20talk"))
-        for r in data.get("results", []):
-            name = _norm(r.get("collectionName", "") + " " + r.get("artistName", ""))
-            if "freeze" in name and "talk" in name and r.get("feedUrl"):
-                log("Podcast-Feed gefunden:", r["feedUrl"])
-                return r["feedUrl"]
-        log("Podcast-Feed bei Apple Podcasts nicht gefunden.")
-    except Exception as e:
-        log("Podcast-Suche Fehler:", e)
-    return None
+        return [os.environ["PODCAST_RSS"]]
+    import urllib.parse
+    feeds = []
+    for term in ["freeze & talk", "freeze and talk", "freezeclub", "freeze talk podcast"]:
+        for country in ["DE", "US"]:
+            try:
+                data = json.loads(fetch("https://itunes.apple.com/search?media=podcast&limit=50"
+                                        f"&country={country}&term=" + urllib.parse.quote(term)))
+            except Exception as e:
+                log("Podcast-Suche Fehler:", e); continue
+            for r in data.get("results", []):
+                name = _norm(r.get("collectionName", "") + " " + r.get("artistName", ""))
+                if "freeze" in name and r.get("feedUrl") and r["feedUrl"] not in feeds:
+                    log("Podcast-Kandidat:", r.get("collectionName"), "→", r["feedUrl"])
+                    feeds.append(r["feedUrl"])
+    return feeds
 
-def podcast_audio_url(ep):
-    rss = podcast_rss_url()
-    if not rss:
-        return None
-    try:
-        data = fetch(rss, timeout=60)
-    except Exception as e:
-        log("Podcast-Feed nicht erreichbar:", e); return None
+def _find_in_feed(data, ep):
     want = set(w for w in _norm(ep["title"]).split() if len(w) > 3)
     best, best_score = None, 0
     for item in re.findall(r"<item>(.*?)</item>", data, re.S):
@@ -201,10 +198,21 @@ def podcast_audio_url(ep):
             score += 3
         if score > best_score:
             best, best_score = html.unescape(en.group(1)), score
-    if best and best_score >= 3:
-        log("Audio der Folge:", best)
-        return best
-    log("Folge im Podcast-Feed nicht gefunden.")
+    # Mindestens die halbe Titel-Übereinstimmung – sonst ist es nicht unsere Folge
+    return best if best and best_score >= max(3, len(want) // 2) else None
+
+def podcast_audio_url(ep):
+    for rss in podcast_rss_urls():
+        try:
+            data = fetch(rss, timeout=60)
+        except Exception as e:
+            log("Podcast-Feed nicht erreichbar:", rss, e); continue
+        url = _find_in_feed(data, ep)
+        if url:
+            log("Audio der Folge:", url)
+            return url
+        log("Folge nicht in diesem Feed:", rss)
+    log("Folge in keinem Podcast-Feed gefunden – ggf. Repo-Variable PODCAST_RSS setzen.")
     return None
 
 def audio_transcript(ep):
