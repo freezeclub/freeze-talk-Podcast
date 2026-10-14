@@ -5,8 +5,17 @@ index.html (Hero, Folgen-Liste, Zitat). Läuft im GitHub Action – rechner-
 unabhängig. Deterministische HTML-Edits in Python; das Zitat wird (optional)
 von Claude aus dem Transkript gewählt, wenn ANTHROPIC_API_KEY gesetzt ist.
 
+Zitat-Quellen (in dieser Reihenfolge):
+  1. YouTube-Transkript (+ Claude/Gemini/Heuristik zur Auswahl). YouTube sperrt
+     allerdings die IPs von GitHub-Servern – ohne YT_PROXY_URL klappt das dort
+     meist nicht.
+  2. Gemini schaut sich das YouTube-Video direkt an (kein Transkript-Abruf
+     von uns nötig) – braucht GEMINI_API_KEY (kostenlos bei Google AI Studio).
+
 Env:
-  ANTHROPIC_API_KEY   optional – aktiviert die automatische Zitat-Auswahl
+  GEMINI_API_KEY      empfohlen – Zitat direkt aus dem Video (funktioniert trotz IP-Sperre)
+  ANTHROPIC_API_KEY   optional – Claude wählt das Zitat aus dem Transkript
+  YT_PROXY_URL        optional – Proxy für den Transkript-Abruf (http://user:pass@host:port)
   SIMULATE_CURRENT_ID optional – überschreibt die "aktuelle" Hero-ID (nur Test)
   DRY_RUN=1           optional – schreibt index.html nicht, nur Log/Diff-Info
 
@@ -104,10 +113,13 @@ def date_de(published):
 def get_transcript(vid):
     try:
         from youtube_transcript_api import YouTubeTranscriptApi as Y
-        try:
-            data = Y.get_transcript(vid, languages=["de", "de-DE"])
-        except Exception:
-            data = [{"text": s.text} for s in Y().fetch(vid, languages=["de", "de-DE"])]
+        proxy = os.environ.get("YT_PROXY_URL")
+        if proxy:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+            api = Y(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
+        else:
+            api = Y()
+        data = [{"text": s.text} for s in api.fetch(vid, languages=["de", "de-DE"])]
         return " ".join(d["text"].replace("\n", " ") for d in data)
     except Exception as e:
         log("Transkript nicht verfügbar:", e)
@@ -143,9 +155,11 @@ def _anthropic_quote(transcript, ep):
     except Exception as e:
         log("Anthropic-Zitat Fehler:", e); return None
 
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
 def _gemini_quote(transcript, ep):
     key = os.environ["GEMINI_API_KEY"]
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = GEMINI_MODEL
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     body = json.dumps({"contents": [{"parts": [{"text": _prompt(transcript, ep)}]}]}).encode()
     req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
@@ -155,6 +169,34 @@ def _gemini_quote(transcript, ep):
         return _extract_json_quote(text)
     except Exception as e:
         log("Gemini-Zitat Fehler:", e); return None
+
+def _gemini_video_quote(vid, ep):
+    """Gemini lädt das Video selbst von YouTube – kein Transkript-Abruf von uns nötig."""
+    key = os.environ["GEMINI_API_KEY"]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
+    prompt = (
+        "Du bist Redakteur für den deutschen Gesundheits-Podcast 'freeze & talk'. "
+        "Hör dir diese Folge an und wähle EIN einzelnes, starkes, in sich verständliches Zitat "
+        f"des Gastes ({ep['guest'] or 'Gast'}), das die Folge '{ep['title']}' gut repräsentiert. "
+        "Regeln: wörtlich so gesagt, nichts erfinden oder umformulieren; nur der Gast, nicht der "
+        "Moderator; ein vollständiger Satz, prägnant (ca. 60–160 Zeichen); Füllwörter (ähm, halt, "
+        "sozusagen) entfernen, Groß-/Kleinschreibung und Satzzeichen korrigieren. "
+        "Antworte AUSSCHLIESSLICH mit JSON: {\"quote\":\"...\"}."
+    )
+    body = json.dumps({
+        "contents": [{"parts": [
+            {"file_data": {"file_uri": f"https://www.youtube.com/watch?v={vid}"}},
+            {"text": prompt}]}],
+        "generationConfig": {"mediaResolution": "MEDIA_RESOLUTION_LOW",
+                             "responseMimeType": "application/json"},
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    try:
+        resp = json.loads(urllib.request.urlopen(req, timeout=300).read())
+        text = resp["candidates"][0]["content"]["parts"][0]["text"]
+        return _extract_json_quote(text)
+    except Exception as e:
+        log("Gemini-Video-Zitat Fehler:", e); return None
 
 FILLERS = re.compile(r"\b([Ää]hm?|halt|sozusagen|quasi|gell|ne)\b[,]?\s*", re.I)
 
@@ -186,8 +228,13 @@ def heuristic_quote(transcript):
     best = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s+", " ", best)).strip()
     return best[0].upper() + best[1:]
 
-def pick_quote(transcript, ep):
+def pick_quote(vid, ep):
+    transcript = get_transcript(vid)
     if not transcript:
+        if os.environ.get("GEMINI_API_KEY"):
+            log("Kein Transkript – Gemini schaut sich das Video direkt an …")
+            return _gemini_video_quote(vid, ep)
+        log("Kein Transkript und kein GEMINI_API_KEY – Zitat kann nicht gezogen werden.")
         return None
     if os.environ.get("ANTHROPIC_API_KEY"):
         q = _anthropic_quote(transcript, ep)
@@ -223,7 +270,11 @@ def finalize(doc, nid, msg):
     log(msg); gh_output(changed="true", commit_msg=msg)
 
 def main():
-    ep = newest_episode()
+    try:
+        ep = newest_episode()
+    except Exception as e:
+        # YouTubes RSS-Feed liefert ab und zu kurz 404/500 – nächster Lauf holt es nach.
+        log("Feed gerade nicht erreichbar:", e); set_output(False); return
     if not ep:
         log("Keine freeze & talk Folge im Feed gefunden."); set_output(False); return
     p = parse_title(ep["title"])
@@ -240,12 +291,12 @@ def main():
         cm = re.search(r'<cite>[\s\S]*?Folge\s*#?(\d+)\s*</cite>', doc)
         cite_num = cm.group(1) if cm else None
         if cite_num != p["num"]:
-            q = pick_quote(get_transcript(current_id), p)
+            q = pick_quote(current_id, p)
             if q:
                 doc = set_quote(doc, q, p["guest"], p["num"])
                 finalize(doc, current_id, f"Zitat nachgezogen für Folge #{p['num']}")
                 return
-            log(f"Keine neue Folge; Zitat für #{p['num']} noch nicht verfügbar (Transkript fehlt).")
+            log(f"Keine neue Folge; Zitat für #{p['num']} noch nicht verfügbar.")
             set_output(False); return
         log(f"Keine neue Folge – aktuell ist weiterhin #{p['num']}, Zitat aktuell.")
         set_output(False); return
@@ -304,12 +355,12 @@ def main():
         doc = doc[:start] + new_block + doc[end:]
 
     # --- Zitat ---
-    quote = pick_quote(get_transcript(nid), p)
+    quote = pick_quote(nid, p)
     if quote:
         doc = set_quote(doc, quote, p["guest"], num)
         log(f"Zitat gesetzt: „{quote}“")
     else:
-        log("Zitat noch nicht gesetzt (Transkript fehlt) – wird an einem der nächsten Läufe automatisch nachgezogen.")
+        log("Zitat noch nicht gesetzt – wird an einem der nächsten Läufe automatisch nachgezogen.")
 
     finalize(doc, nid, f"Neue Folge #{num}: {p['title']}")
 

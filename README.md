@@ -9,10 +9,10 @@ mentale Gesundheit**. Ehrliche Gespräche, echte Menschen – regelmäßig neue 
 
 | | |
 |---|---|
-| 🌐 **Website** | **https://freezeclub.github.io** |
+| 🌐 **Website** | **https://podcast.freezeclub.de** |
 | ▶️ **YouTube** | https://www.youtube.com/channel/UCOYIpV_B4ECS51xwBbnH1tQ |
 | 🟢 **Spotify** | https://open.spotify.com/show/033B4fVBdOhflLIU56cQeX |
-| ℹ️ **Über den Podcast (FAQ)** | https://freezeclub.github.io/podcast/ |
+| ℹ️ **Über den Podcast (FAQ)** | https://podcast.freezeclub.de/podcast/ |
 
 ## Über den Podcast
 
@@ -55,7 +55,7 @@ Wilhelmstraße 45, 72336 Balingen, Deutschland.
 ### Über dieses Repository
 
 Dieses Repository enthält die offizielle **Podcast- und Link-in-Bio-Seite** von freeze & talk,
-gehostet über GitHub Pages unter **https://freezeclub.github.io**. Neue Folgen werden automatisch
+gehostet über GitHub Pages unter **https://podcast.freezeclub.de**. Neue Folgen werden automatisch
 übernommen.
 
 *freeze & talk – ein Podcast des freezeclub Balingen.*

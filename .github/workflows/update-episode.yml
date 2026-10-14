@@ -31,7 +31,9 @@ jobs:
       - name: Auf neue Folge pruefen & Seite aktualisieren
         id: run
         env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          YT_PROXY_URL: ${{ secrets.YT_PROXY_URL }}
         run: python scripts/update_episode.py
 
       - name: Committen & pushen (nur bei Aenderung)
