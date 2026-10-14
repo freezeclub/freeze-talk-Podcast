@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://freezeclub.github.io/sitemap.xml
+Sitemap: https://podcast.freezeclub.de/sitemap.xml

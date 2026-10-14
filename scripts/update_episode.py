@@ -5,8 +5,21 @@ index.html (Hero, Folgen-Liste, Zitat). Läuft im GitHub Action – rechner-
 unabhängig. Deterministische HTML-Edits in Python; das Zitat wird (optional)
 von Claude aus dem Transkript gewählt, wenn ANTHROPIC_API_KEY gesetzt ist.
 
+Zitat-Quellen (in dieser Reihenfolge, alles ohne API-Key möglich):
+  1. YouTube-Transkript. YouTube sperrt allerdings die IPs von GitHub-Servern –
+     ohne YT_PROXY_URL klappt das dort meist nicht.
+  2. Audio aus dem öffentlichen Podcast-RSS-Feed (über Apple Podcasts gefunden
+     oder PODCAST_RSS) → lokal mit Whisper abgeschrieben. Kein Key nötig.
+  3. Optional: Gemini schaut sich das YouTube-Video direkt an (GEMINI_API_KEY).
+Die Auswahl des Satzes macht – ohne Key – eine Heuristik; mit ANTHROPIC_API_KEY
+oder GEMINI_API_KEY eine KI.
+
 Env:
-  ANTHROPIC_API_KEY   optional – aktiviert die automatische Zitat-Auswahl
+  PODCAST_RSS         optional – RSS-Feed des Podcasts (sonst automatische Suche)
+  WHISPER_MODEL       optional – Whisper-Modell (Standard: small)
+  GEMINI_API_KEY      optional – Zitat direkt aus dem Video
+  ANTHROPIC_API_KEY   optional – Claude wählt das Zitat aus dem Transkript
+  YT_PROXY_URL        optional – Proxy für den Transkript-Abruf (http://user:pass@host:port)
   SIMULATE_CURRENT_ID optional – überschreibt die "aktuelle" Hero-ID (nur Test)
   DRY_RUN=1           optional – schreibt index.html nicht, nur Log/Diff-Info
 
@@ -104,10 +117,13 @@ def date_de(published):
 def get_transcript(vid):
     try:
         from youtube_transcript_api import YouTubeTranscriptApi as Y
-        try:
-            data = Y.get_transcript(vid, languages=["de", "de-DE"])
-        except Exception:
-            data = [{"text": s.text} for s in Y().fetch(vid, languages=["de", "de-DE"])]
+        proxy = os.environ.get("YT_PROXY_URL")
+        if proxy:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+            api = Y(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
+        else:
+            api = Y()
+        data = [{"text": s.text} for s in api.fetch(vid, languages=["de", "de-DE"])]
         return " ".join(d["text"].replace("\n", " ") for d in data)
     except Exception as e:
         log("Transkript nicht verfügbar:", e)
@@ -143,9 +159,86 @@ def _anthropic_quote(transcript, ep):
     except Exception as e:
         log("Anthropic-Zitat Fehler:", e); return None
 
+# ---------- Audio-Weg: Podcast-RSS + Whisper (ohne Key, ohne YouTube) ----------
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9äöüß]+", " ", html.unescape(s or "").lower()).strip()
+
+def podcast_rss_url():
+    if os.environ.get("PODCAST_RSS"):
+        return os.environ["PODCAST_RSS"]
+    try:
+        data = json.loads(fetch("https://itunes.apple.com/search?media=podcast&country=DE"
+                                "&term=freeze%20talk"))
+        for r in data.get("results", []):
+            name = _norm(r.get("collectionName", "") + " " + r.get("artistName", ""))
+            if "freeze" in name and "talk" in name and r.get("feedUrl"):
+                log("Podcast-Feed gefunden:", r["feedUrl"])
+                return r["feedUrl"]
+        log("Podcast-Feed bei Apple Podcasts nicht gefunden.")
+    except Exception as e:
+        log("Podcast-Suche Fehler:", e)
+    return None
+
+def podcast_audio_url(ep):
+    rss = podcast_rss_url()
+    if not rss:
+        return None
+    try:
+        data = fetch(rss, timeout=60)
+    except Exception as e:
+        log("Podcast-Feed nicht erreichbar:", e); return None
+    want = set(w for w in _norm(ep["title"]).split() if len(w) > 3)
+    best, best_score = None, 0
+    for item in re.findall(r"<item>(.*?)</item>", data, re.S):
+        tm = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", item, re.S)
+        en = re.search(r'<enclosure[^>]*url="([^"]+)"', item)
+        if not (tm and en):
+            continue
+        title = tm.group(1)
+        score = len(want & set(_norm(title).split()))
+        if re.search(rf"#\s*{re.escape(ep['num'])}\b", title):
+            score += 3
+        if score > best_score:
+            best, best_score = html.unescape(en.group(1)), score
+    if best and best_score >= 3:
+        log("Audio der Folge:", best)
+        return best
+    log("Folge im Podcast-Feed nicht gefunden.")
+    return None
+
+def audio_transcript(ep):
+    url = podcast_audio_url(ep)
+    if not url:
+        return None
+    import subprocess, tempfile
+    try:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "faster-whisper"], check=True)
+            from faster_whisper import WhisperModel
+        tmp = tempfile.mkdtemp()
+        src, wav = os.path.join(tmp, "folge.audio"), os.path.join(tmp, "folge.wav")
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=300) as r, open(src, "wb") as f:
+            f.write(r.read())
+        # Intro überspringen, ~20 Minuten reichen für ein gutes Zitat und halten den Lauf kurz.
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", "120", "-t", "1200",
+                        "-i", src, "-ac", "1", "-ar", "16000", wav], check=True)
+        model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
+        segs, _ = model.transcribe(wav, language="de", vad_filter=True)
+        text = " ".join(sg.text.strip() for sg in segs)
+        log(f"Audio abgeschrieben ({len(text)} Zeichen).")
+        return text or None
+    except Exception as e:
+        log("Audio-Transkript Fehler:", e); return None
+
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
 def _gemini_quote(transcript, ep):
     key = os.environ["GEMINI_API_KEY"]
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = GEMINI_MODEL
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     body = json.dumps({"contents": [{"parts": [{"text": _prompt(transcript, ep)}]}]}).encode()
     req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
@@ -156,15 +249,46 @@ def _gemini_quote(transcript, ep):
     except Exception as e:
         log("Gemini-Zitat Fehler:", e); return None
 
+def _gemini_video_quote(vid, ep):
+    """Gemini lädt das Video selbst von YouTube – kein Transkript-Abruf von uns nötig."""
+    key = os.environ["GEMINI_API_KEY"]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
+    prompt = (
+        "Du bist Redakteur für den deutschen Gesundheits-Podcast 'freeze & talk'. "
+        "Hör dir diese Folge an und wähle EIN einzelnes, starkes, in sich verständliches Zitat "
+        f"des Gastes ({ep['guest'] or 'Gast'}), das die Folge '{ep['title']}' gut repräsentiert. "
+        "Regeln: wörtlich so gesagt, nichts erfinden oder umformulieren; nur der Gast, nicht der "
+        "Moderator; ein vollständiger Satz, prägnant (ca. 60–160 Zeichen); Füllwörter (ähm, halt, "
+        "sozusagen) entfernen, Groß-/Kleinschreibung und Satzzeichen korrigieren. "
+        "Antworte AUSSCHLIESSLICH mit JSON: {\"quote\":\"...\"}."
+    )
+    body = json.dumps({
+        "contents": [{"parts": [
+            {"file_data": {"file_uri": f"https://www.youtube.com/watch?v={vid}"}},
+            {"text": prompt}]}],
+        "generationConfig": {"mediaResolution": "MEDIA_RESOLUTION_LOW",
+                             "responseMimeType": "application/json"},
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    try:
+        resp = json.loads(urllib.request.urlopen(req, timeout=300).read())
+        text = resp["candidates"][0]["content"]["parts"][0]["text"]
+        return _extract_json_quote(text)
+    except Exception as e:
+        log("Gemini-Video-Zitat Fehler:", e); return None
+
 FILLERS = re.compile(r"\b([Ää]hm?|halt|sozusagen|quasi|gell|ne)\b[,]?\s*", re.I)
 
-def heuristic_quote(transcript):
+def heuristic_quote(transcript, ep=None):
     """Kostenlose Auswahl ganz ohne KI: bester klarer Aussagesatz aus dem Transkript."""
     t = re.sub(r"\[[^\]]*\]", " ", transcript)       # [gelächter] u.ä. entfernen
     t = re.sub(r"\s+", " ", t)
     KW = ["training", "gesünd", "gesund", "körper", "ernährung", "regeneration", "stress",
           "schlaf", "bewegung", "kraft", "mental", "alltag", "respekt", "ziel", "muskel",
-          "verletzung", "balance", "energie", "erholung"]
+          "verletzung", "balance", "energie", "erholung", "atem", "atmen", "atmung",
+          "gehirn", "nerven", "kälte", "fasten", "immun", "angst", "ruhe", "gesundheit"]
+    if ep:  # Wörter aus dem Folgentitel zählen mit – so passt das Zitat zum Thema
+        KW += [w for w in _norm(ep["title"]).split() if len(w) > 4]
     best, best_score = None, 2   # Mindest-Score – sonst lieber kein Zitat
     for s in re.split(r"(?<=[.!?])\s+", t):
         s = s.strip()
@@ -186,8 +310,16 @@ def heuristic_quote(transcript):
     best = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s+", " ", best)).strip()
     return best[0].upper() + best[1:]
 
-def pick_quote(transcript, ep):
+def pick_quote(vid, ep):
+    transcript = get_transcript(vid)
     if not transcript:
+        log("Kein YouTube-Transkript – versuche Audio aus dem Podcast-Feed …")
+        transcript = audio_transcript(ep)
+    if not transcript:
+        if os.environ.get("GEMINI_API_KEY"):
+            log("Kein Transkript – Gemini schaut sich das Video direkt an …")
+            return _gemini_video_quote(vid, ep)
+        log("Kein Transkript verfügbar – Zitat kann diesmal nicht gezogen werden.")
         return None
     if os.environ.get("ANTHROPIC_API_KEY"):
         q = _anthropic_quote(transcript, ep)
@@ -197,7 +329,7 @@ def pick_quote(transcript, ep):
         q = _gemini_quote(transcript, ep)
         if q:
             return q
-    return heuristic_quote(transcript)  # gratis, ohne Key
+    return heuristic_quote(transcript, ep)  # gratis, ohne Key
 
 def sub1(pattern, repl, text, flags=0):
     new, n = re.subn(pattern, repl, text, count=1, flags=flags)
@@ -223,7 +355,11 @@ def finalize(doc, nid, msg):
     log(msg); gh_output(changed="true", commit_msg=msg)
 
 def main():
-    ep = newest_episode()
+    try:
+        ep = newest_episode()
+    except Exception as e:
+        # YouTubes RSS-Feed liefert ab und zu kurz 404/500 – nächster Lauf holt es nach.
+        log("Feed gerade nicht erreichbar:", e); set_output(False); return
     if not ep:
         log("Keine freeze & talk Folge im Feed gefunden."); set_output(False); return
     p = parse_title(ep["title"])
@@ -240,12 +376,12 @@ def main():
         cm = re.search(r'<cite>[\s\S]*?Folge\s*#?(\d+)\s*</cite>', doc)
         cite_num = cm.group(1) if cm else None
         if cite_num != p["num"]:
-            q = pick_quote(get_transcript(current_id), p)
+            q = pick_quote(current_id, p)
             if q:
                 doc = set_quote(doc, q, p["guest"], p["num"])
                 finalize(doc, current_id, f"Zitat nachgezogen für Folge #{p['num']}")
                 return
-            log(f"Keine neue Folge; Zitat für #{p['num']} noch nicht verfügbar (Transkript fehlt).")
+            log(f"Keine neue Folge; Zitat für #{p['num']} noch nicht verfügbar.")
             set_output(False); return
         log(f"Keine neue Folge – aktuell ist weiterhin #{p['num']}, Zitat aktuell.")
         set_output(False); return
@@ -304,12 +440,12 @@ def main():
         doc = doc[:start] + new_block + doc[end:]
 
     # --- Zitat ---
-    quote = pick_quote(get_transcript(nid), p)
+    quote = pick_quote(nid, p)
     if quote:
         doc = set_quote(doc, quote, p["guest"], num)
         log(f"Zitat gesetzt: „{quote}“")
     else:
-        log("Zitat noch nicht gesetzt (Transkript fehlt) – wird an einem der nächsten Läufe automatisch nachgezogen.")
+        log("Zitat noch nicht gesetzt – wird an einem der nächsten Läufe automatisch nachgezogen.")
 
     finalize(doc, nid, f"Neue Folge #{num}: {p['title']}")
 
