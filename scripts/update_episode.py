@@ -8,14 +8,14 @@ von Claude aus dem Transkript gewählt, wenn ANTHROPIC_API_KEY gesetzt ist.
 Zitat-Quellen (in dieser Reihenfolge, alles ohne API-Key möglich):
   1. YouTube-Transkript. YouTube sperrt allerdings die IPs von GitHub-Servern –
      ohne YT_PROXY_URL klappt das dort meist nicht.
-  2. Audio aus dem öffentlichen Podcast-RSS-Feed (über Apple Podcasts gefunden
-     oder PODCAST_RSS) → lokal mit Whisper abgeschrieben. Kein Key nötig.
+  2. Audio aus dem öffentlichen Podcast-RSS-Feed (PODCAST_RSS_DEFAULT bzw.
+     PODCAST_RSS, notfalls Apple-Suche) → lokal mit Whisper abgeschrieben. Kein Key nötig.
   3. Optional: Gemini schaut sich das YouTube-Video direkt an (GEMINI_API_KEY).
 Die Auswahl des Satzes macht – ohne Key – eine Heuristik; mit ANTHROPIC_API_KEY
 oder GEMINI_API_KEY eine KI.
 
 Env:
-  PODCAST_RSS         optional – RSS-Feed des Podcasts (sonst automatische Suche)
+  PODCAST_RSS         optional – überschreibt den RSS-Feed des Podcasts
   WHISPER_MODEL       optional – Whisper-Modell (Standard: small)
   GEMINI_API_KEY      optional – Zitat direkt aus dem Video
   ANTHROPIC_API_KEY   optional – Claude wählt das Zitat aus dem Transkript
@@ -31,6 +31,8 @@ import os, re, sys, json, html, urllib.request, urllib.error
 CHANNEL = "UCOYIpV_B4ECS51xwBbnH1tQ"
 RSS = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL}"
 INDEX = os.path.join(os.path.dirname(__file__), "..", "index.html")
+LLMS = os.path.join(os.path.dirname(__file__), "..", "llms.txt")
+PODCAST_RSS_DEFAULT = "https://anchor.fm/s/113f6de0c/podcast/rss"   # Spotify for Creators
 MONTHS = ["Januar","Februar","März","April","Mai","Juni","Juli","August",
           "September","Oktober","November","Dezember"]
 
@@ -166,10 +168,8 @@ def _norm(s):
 
 def podcast_rss_urls():
     """Kandidaten-Feeds: PODCAST_RSS oder alle Apple-Podcasts-Treffer mit 'freeze' im Namen."""
-    if os.environ.get("PODCAST_RSS"):
-        return [os.environ["PODCAST_RSS"]]
+    feeds = [os.environ.get("PODCAST_RSS") or PODCAST_RSS_DEFAULT]
     import urllib.parse
-    feeds = []
     for term in ["freeze & talk", "freeze and talk", "freezeclub", "freeze talk podcast"]:
         for country in ["DE", "US"]:
             try:
@@ -353,6 +353,22 @@ def set_quote(doc, quote, guest, num):
                lambda mm: mm.group(1) + attrib + mm.group(2), doc)
     return doc
 
+def update_llms(nid, num, title, guest):
+    """Neue Folge oben in die Folgenliste von llms.txt (GEO), max. 4 Einträge."""
+    try:
+        txt = open(LLMS, encoding="utf-8").read()
+    except FileNotFoundError:
+        return
+    m = re.search(r"(<!-- FOLGEN:START -->\n)([\s\S]*?)(<!-- FOLGEN:END -->)", txt)
+    if not m or nid in m.group(2):
+        return
+    entry = f"- [Folge #{num}: {title}" + (f" – mit {guest}" if guest else "") + \
+            f"](https://www.youtube.com/watch?v={nid})\n"
+    lines = [entry] + [l + "\n" for l in m.group(2).splitlines() if l.strip()][:3]
+    txt = txt[:m.start(2)] + "".join(lines) + txt[m.end(2):]
+    if os.environ.get("DRY_RUN") != "1":
+        open(LLMS, "w", encoding="utf-8").write(txt)
+
 def finalize(doc, nid, msg):
     if not (doc.strip().startswith("<!DOCTYPE") and nid in doc):
         raise RuntimeError("Ergebnis sieht ungültig aus – abgebrochen.")
@@ -455,6 +471,7 @@ def main():
     else:
         log("Zitat noch nicht gesetzt – wird an einem der nächsten Läufe automatisch nachgezogen.")
 
+    update_llms(nid, num, p["title"], p["guest"])
     finalize(doc, nid, f"Neue Folge #{num}: {p['title']}")
 
 if __name__ == "__main__":
