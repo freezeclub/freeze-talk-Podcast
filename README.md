@@ -12,6 +12,8 @@ mentale Gesundheit**. Ehrliche Gespräche, echte Menschen – regelmäßig neue 
 | 🌐 **Website** | **https://podcast.freezeclub.de** |
 | ▶️ **YouTube** | https://www.youtube.com/channel/UCOYIpV_B4ECS51xwBbnH1tQ |
 | 🟢 **Spotify** | https://open.spotify.com/show/033B4fVBdOhflLIU56cQeX |
+| 🎙️ **Spotify for Creators** | https://creators.spotify.com/pod/profile/freezeandtalk/ |
+| 📡 **RSS-Feed** | https://anchor.fm/s/113f6de0c/podcast/rss |
 | ℹ️ **Über den Podcast (FAQ)** | https://podcast.freezeclub.de/podcast/ |
 
 ## Über den Podcast
