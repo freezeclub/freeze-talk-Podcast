@@ -168,8 +168,9 @@ def _norm(s):
 
 def podcast_rss_urls():
     """Kandidaten-Feeds: PODCAST_RSS oder alle Apple-Podcasts-Treffer mit 'freeze' im Namen."""
-    feeds = [os.environ.get("PODCAST_RSS") or PODCAST_RSS_DEFAULT]
+    yield os.environ.get("PODCAST_RSS") or PODCAST_RSS_DEFAULT
     import urllib.parse
+    feeds = []
     for term in ["freeze & talk", "freeze and talk", "freezeclub", "freeze talk podcast"]:
         for country in ["DE", "US"]:
             try:
@@ -182,7 +183,7 @@ def podcast_rss_urls():
                 if "freeze" in name and r.get("feedUrl") and r["feedUrl"] not in feeds:
                     log("Podcast-Kandidat:", r.get("collectionName"), "→", r["feedUrl"])
                     feeds.append(r["feedUrl"])
-    return feeds
+                    yield r["feedUrl"]
 
 def _find_in_feed(data, ep):
     want = set(w for w in _norm(ep["title"]).split() if len(w) > 3)
@@ -235,7 +236,11 @@ def audio_transcript(ep):
         subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", "120", "-t", "1200",
                         "-i", src, "-ac", "1", "-ar", "16000", wav], check=True)
         model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
-        segs, _ = model.transcribe(wav, language="de", vad_filter=True)
+        # WAV selbst einlesen statt über PyAV (Versionskonflikte bei neuen PyAV-Releases)
+        import wave, numpy as np
+        with wave.open(wav, "rb") as w:
+            audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768.0
+        segs, _ = model.transcribe(audio, language="de", vad_filter=True)
         text = " ".join(sg.text.strip() for sg in segs)
         log(f"Audio abgeschrieben ({len(text)} Zeichen).")
         return text or None
