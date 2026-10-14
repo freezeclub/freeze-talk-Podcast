@@ -167,17 +167,22 @@ def _norm(s):
 def podcast_rss_url():
     if os.environ.get("PODCAST_RSS"):
         return os.environ["PODCAST_RSS"]
-    try:
-        data = json.loads(fetch("https://itunes.apple.com/search?media=podcast&country=DE"
-                                "&term=freeze%20talk"))
-        for r in data.get("results", []):
-            name = _norm(r.get("collectionName", "") + " " + r.get("artistName", ""))
-            if "freeze" in name and "talk" in name and r.get("feedUrl"):
-                log("Podcast-Feed gefunden:", r["feedUrl"])
-                return r["feedUrl"]
-        log("Podcast-Feed bei Apple Podcasts nicht gefunden.")
-    except Exception as e:
-        log("Podcast-Suche Fehler:", e)
+    import urllib.parse
+    for term in ["freeze & talk", "freeze and talk", "freezeclub", "freeze talk podcast"]:
+        for country in ["DE", "US"]:
+            try:
+                data = json.loads(fetch("https://itunes.apple.com/search?media=podcast&limit=50"
+                                        f"&country={country}&term=" + urllib.parse.quote(term)))
+            except Exception as e:
+                log("Podcast-Suche Fehler:", e); continue
+            for r in data.get("results", []):
+                name = _norm(r.get("collectionName", "") + " " + r.get("artistName", ""))
+                if "freeze" in name and r.get("feedUrl"):
+                    log("Podcast-Feed gefunden:", r.get("collectionName"), "→", r["feedUrl"])
+                    return r["feedUrl"]
+            found = [r.get("collectionName") for r in data.get("results", [])][:5]
+            log(f"Apple-Suche '{term}' ({country}): kein Treffer. Erste Ergebnisse: {found}")
+    log("Podcast-Feed bei Apple Podcasts nicht gefunden – ggf. Repo-Variable PODCAST_RSS setzen.")
     return None
 
 def podcast_audio_url(ep):
