@@ -6,7 +6,16 @@ on:
   schedule:
     - cron: "0 13 * * *"   # taeglich 13:00 UTC = 14-15 Uhr DE
     - cron: "0 18 * * 2"   # zusaetzlich Dienstagabend 18:00 UTC = 19-20 Uhr DE
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      neues_zitat:
+        description: "Zitat der aktuellen Folge neu auswaehlen"
+        type: boolean
+        default: false
+      zitat:
+        description: "Zitat von Hand setzen (leer lassen = automatisch)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -18,7 +27,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -37,10 +46,20 @@ jobs:
           path: ~/.cache/huggingface
           key: whisper-small
 
+      # Lokale KI (Ollama) fuer die Zitat-Auswahl zwischenspeichern
+      - uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen2.5-7b
+
       - name: Auf neue Folge pruefen & Seite aktualisieren
         id: run
         env:
           PODCAST_RSS: ${{ vars.PODCAST_RSS }}
+          FORCE_QUOTE: ${{ inputs.neues_zitat }}
+          MANUAL_QUOTE: ${{ inputs.zitat }}
+          LOCAL_LLM: "1"
+          OLLAMA_MODELS: /home/runner/.ollama/models
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           YT_PROXY_URL: ${{ secrets.YT_PROXY_URL }}

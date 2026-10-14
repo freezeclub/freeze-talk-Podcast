@@ -8,18 +8,19 @@ von Claude aus dem Transkript gewählt, wenn ANTHROPIC_API_KEY gesetzt ist.
 Zitat-Quellen (in dieser Reihenfolge, alles ohne API-Key möglich):
   1. YouTube-Transkript. YouTube sperrt allerdings die IPs von GitHub-Servern –
      ohne YT_PROXY_URL klappt das dort meist nicht.
-  2. Audio aus dem öffentlichen Podcast-RSS-Feed (über Apple Podcasts gefunden
-     oder PODCAST_RSS) → lokal mit Whisper abgeschrieben. Kein Key nötig.
+  2. Audio aus dem öffentlichen Podcast-RSS-Feed (PODCAST_RSS_DEFAULT bzw.
+     PODCAST_RSS, notfalls Apple-Suche) → lokal mit Whisper abgeschrieben. Kein Key nötig.
   3. Optional: Gemini schaut sich das YouTube-Video direkt an (GEMINI_API_KEY).
-Die Auswahl des Satzes macht – ohne Key – eine Heuristik; mit ANTHROPIC_API_KEY
-oder GEMINI_API_KEY eine KI.
+Die Auswahl des Satzes: Vorauswahl per Heuristik, dann wählt eine kleine lokale KI
+(Ollama, LOCAL_LLM=1) – kostenlos und ohne Key. Optional Claude/Gemini per Key.
 
 Env:
-  PODCAST_RSS         optional – RSS-Feed des Podcasts (sonst automatische Suche)
+  PODCAST_RSS         optional – überschreibt den RSS-Feed des Podcasts
   WHISPER_MODEL       optional – Whisper-Modell (Standard: small)
   GEMINI_API_KEY      optional – Zitat direkt aus dem Video
   ANTHROPIC_API_KEY   optional – Claude wählt das Zitat aus dem Transkript
   YT_PROXY_URL        optional – Proxy für den Transkript-Abruf (http://user:pass@host:port)
+  MANUAL_QUOTE        optional – setzt genau dieses Zitat für die aktuelle Folge
   SIMULATE_CURRENT_ID optional – überschreibt die "aktuelle" Hero-ID (nur Test)
   DRY_RUN=1           optional – schreibt index.html nicht, nur Log/Diff-Info
 
@@ -31,6 +32,8 @@ import os, re, sys, json, html, urllib.request, urllib.error
 CHANNEL = "UCOYIpV_B4ECS51xwBbnH1tQ"
 RSS = f"https://www.youtube.com/feeds/videos.xml?channel_id={CHANNEL}"
 INDEX = os.path.join(os.path.dirname(__file__), "..", "index.html")
+LLMS = os.path.join(os.path.dirname(__file__), "..", "llms.txt")
+PODCAST_RSS_DEFAULT = "https://anchor.fm/s/113f6de0c/podcast/rss"   # Spotify for Creators
 MONTHS = ["Januar","Februar","März","April","Mai","Juni","Juli","August",
           "September","Oktober","November","Dezember"]
 
@@ -166,8 +169,7 @@ def _norm(s):
 
 def podcast_rss_urls():
     """Kandidaten-Feeds: PODCAST_RSS oder alle Apple-Podcasts-Treffer mit 'freeze' im Namen."""
-    if os.environ.get("PODCAST_RSS"):
-        return [os.environ["PODCAST_RSS"]]
+    yield os.environ.get("PODCAST_RSS") or PODCAST_RSS_DEFAULT
     import urllib.parse
     feeds = []
     for term in ["freeze & talk", "freeze and talk", "freezeclub", "freeze talk podcast"]:
@@ -182,7 +184,7 @@ def podcast_rss_urls():
                 if "freeze" in name and r.get("feedUrl") and r["feedUrl"] not in feeds:
                     log("Podcast-Kandidat:", r.get("collectionName"), "→", r["feedUrl"])
                     feeds.append(r["feedUrl"])
-    return feeds
+                    yield r["feedUrl"]
 
 def _find_in_feed(data, ep):
     want = set(w for w in _norm(ep["title"]).split() if len(w) > 3)
@@ -231,11 +233,15 @@ def audio_transcript(ep):
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=300) as r, open(src, "wb") as f:
             f.write(r.read())
-        # Intro überspringen, ~20 Minuten reichen für ein gutes Zitat und halten den Lauf kurz.
-        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", "120", "-t", "1200",
+        # Intro überspringen, ~35 Minuten reichen für ein gutes Zitat und halten den Lauf überschaubar.
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-ss", "120", "-t", "2100",
                         "-i", src, "-ac", "1", "-ar", "16000", wav], check=True)
         model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
-        segs, _ = model.transcribe(wav, language="de", vad_filter=True)
+        # WAV selbst einlesen statt über PyAV (Versionskonflikte bei neuen PyAV-Releases)
+        import wave, numpy as np
+        with wave.open(wav, "rb") as w:
+            audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768.0
+        segs, _ = model.transcribe(audio, language="de", vad_filter=True)
         text = " ".join(sg.text.strip() for sg in segs)
         log(f"Audio abgeschrieben ({len(text)} Zeichen).")
         return text or None
@@ -287,36 +293,136 @@ def _gemini_video_quote(vid, ep):
 
 FILLERS = re.compile(r"\b([Ää]hm?|halt|sozusagen|quasi|gell|ne)\b[,]?\s*", re.I)
 
-def heuristic_quote(transcript, ep=None):
-    """Kostenlose Auswahl ganz ohne KI: bester klarer Aussagesatz aus dem Transkript."""
+# Gesprächs-/Meta-Floskeln: solche Sätze funktionieren ohne Kontext nicht als Zitat
+META = ["gesagt", "am anfang", "vorhin", "erzählt", "erzähl", "folge", "podcast", "frage",
+        "heute", "gerade", "eben", "nochmal", "noch mal", "wie gesagt", "zuhörer", "kamera",
+        "freent", "frezen", "blabla", "carlos", "insta", "danke", "willkommen", "schön, dass"]
+
+def _quote_score(s, KW):
+    low = s.lower()
+    if not (60 <= len(s) <= 165) or s.endswith("?"):
+        return None
+    if any(g in low for g in META):
+        return None
+    if re.match(r"^(Also|Ja|Aber|Genau|Und|Weil|Ähm|Ne|So|Oder|Dann|Da|Das heißt)\b", s):
+        return None
+    score = sum(2 for kw in set(KW) if kw in low)
+    if re.search(r"\b(ist|sind|kann|können|sollte|muss|müssen|bedeutet|braucht|heißt)\b", low):
+        score += 1
+    if re.search(r"\b(du|dein|deine|dich|dir|wir|unser|man|jeder)\b", low):
+        score += 2                           # allgemeingültig, spricht den Hörer an
+    if re.search(r"\bwenn\b.*\b(dann|wird|bleibt|kann|ist)\b", low):
+        score += 2                           # Wenn-dann-Aussage = gute Kernbotschaft
+    if re.search(r"\b(ich|mir|mich|mein)\b", low):
+        score -= 2                           # persönliche Anekdote, eher kein Zitat
+    if re.search(r"\b(halt|irgendwie|sozusagen|quasi|eigentlich)\b", low):
+        score -= 1
+    return score
+
+def _clean(q):
+    q = FILLERS.sub("", q)
+    q = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s+", " ", q)).strip()
+    return q[0].upper() + q[1:] if q else q
+
+def quote_candidates(transcript, ep=None, n=20):
+    """Vorauswahl ohne KI: die n besten klaren Aussagesätze aus dem Transkript."""
     t = re.sub(r"\[[^\]]*\]", " ", transcript)       # [gelächter] u.ä. entfernen
     t = re.sub(r"\s+", " ", t)
     KW = ["training", "gesünd", "gesund", "körper", "ernährung", "regeneration", "stress",
           "schlaf", "bewegung", "kraft", "mental", "alltag", "respekt", "ziel", "muskel",
           "verletzung", "balance", "energie", "erholung", "atem", "atmen", "atmung",
           "gehirn", "nerven", "kälte", "fasten", "immun", "angst", "ruhe", "gesundheit"]
-    if ep:  # Wörter aus dem Folgentitel zählen mit – so passt das Zitat zum Thema
-        KW += [w for w in _norm(ep["title"]).split() if len(w) > 4]
-    best, best_score = None, 2   # Mindest-Score – sonst lieber kein Zitat
+    if ep:  # Wörter aus dem Folgentitel zählen doppelt – so passt das Zitat zum Thema
+        tw = [w[:-1] if len(w) > 6 else w for w in _norm(ep["title"]).split() if len(w) > 4]
+        KW += tw + tw
+    title_kw = [w[:-1] if len(w) > 6 else w for w in _norm(ep["title"]).split() if len(w) > 4] if ep else []
+    cands = []
     for s in re.split(r"(?<=[.!?])\s+", t):
         s = s.strip()
-        if not (60 <= len(s) <= 165) or s.endswith("?"):
-            continue
-        low = s.lower()
-        if any(g in low for g in ["freent", "frezen", "blabla", "carlos", "insta"]):
-            continue
-        if re.match(r"^(Also|Ja|Aber|Genau|Und|Weil|Ähm|Ne|So )\b", s):
-            continue
-        score = sum(2 for kw in KW if kw in low)
-        if re.search(r"\b(ist|kann|sollte|muss|bedeutet|geht darum)\b", low):
-            score += 1
-        if score > best_score:
-            best, best_score = s, score
-    if not best:
+        sc = _quote_score(s, KW)
+        if sc is not None and sc >= 2:
+            on_topic = any(w in s.lower() for w in title_kw)
+            cands.append((on_topic, sc, s))
+    # Sätze, die ein Wort aus dem Folgentitel enthalten, kommen zuerst – so bleibt es beim Thema
+    cands.sort(key=lambda c: (not c[0], -c[1]))
+    return [s for _, _, s in cands[:n]]
+
+def heuristic_quote(transcript, ep=None):
+    cands = quote_candidates(transcript, ep, n=5)
+    for c in cands:
+        log("  Zitat-Kandidat:", c)
+    return _clean(cands[0]) if cands else None
+
+# ---------- Lokale KI (Ollama, läuft im GitHub-Runner – kostenlos, ohne Key) ----------
+
+LOCAL_LLM = os.environ.get("LOCAL_LLM_MODEL", "qwen2.5:7b")
+
+def _ollama_ready():
+    import shutil, subprocess, time
+    if os.environ.get("LOCAL_LLM") != "1":
+        return False
+    try:
+        if not shutil.which("ollama"):
+            log("Installiere Ollama …")
+            subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True,
+                           stdout=subprocess.DEVNULL)
+            # Der Installer startet einen System-Dienst mit eigenem Modell-Ordner – stoppen,
+            # damit unser Server OLLAMA_MODELS (gecacht) nutzt.
+            subprocess.run("sudo systemctl stop ollama", shell=True, stderr=subprocess.DEVNULL)
+        try:
+            urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=3)
+        except Exception:
+            subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    urllib.request.urlopen("http://127.0.0.1:11434/api/version", timeout=3); break
+                except Exception:
+                    pass
+        subprocess.run(["ollama", "pull", LOCAL_LLM], check=True, stdout=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        log("Lokale KI nicht verfügbar:", e); return False
+
+def _overlap(a, b):
+    wa, wb = set(_norm(a).split()), set(_norm(b).split())
+    return len(wa & wb) / max(1, len(wa))
+
+def local_llm_quote(transcript, ep):
+    cands = quote_candidates(transcript, ep, n=20)
+    if not cands or not _ollama_ready():
         return None
-    best = FILLERS.sub("", best)
-    best = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s+", " ", best)).strip()
-    return best[0].upper() + best[1:]
+    listing = "\n".join(f"{i+1}. {c}" for i, c in enumerate(cands))
+    log("Zitat-Kandidaten für die KI:\n" + listing)
+    prompt = (
+        "Du bist Redakteur für den deutschen Gesundheits-Podcast 'freeze & talk'. "
+        f"Folge: '{ep['title']}' mit {ep['guest'] or 'einem Gast'}.\n"
+        "Unten stehen Sätze aus dem automatischen Transkript. Wähle den EINEN Satz, der als "
+        "Zitat auf der Webseite am stärksten ist: eine klare, in sich verständliche Kernaussage "
+        "die direkt zum Thema der Folge (siehe Titel) passt und Hörern einen Aha-Moment gibt; "
+        "ohne Gesprächsbezug ('wie gesagt', 'am Anfang'), keine Anekdote, nichts über Beruf/Ausbildung.\n"
+        "Glätte ihn behutsam (Füllwörter weg, Grammatik/Satzzeichen korrigieren), aber erfinde "
+        "nichts und ändere die Aussage nicht.\n"
+        'Antworte NUR mit JSON: {"nr": <Nummer>, "quote": "<geglätteter Satz>"}\n\n' + listing
+    )
+    body = json.dumps({"model": LOCAL_LLM, "prompt": prompt, "stream": False, "format": "json",
+                       "options": {"temperature": 0.2}}).encode()
+    try:
+        req = urllib.request.Request("http://127.0.0.1:11434/api/generate", data=body,
+                                     headers={"content-type": "application/json"})
+        resp = json.loads(urllib.request.urlopen(req, timeout=900).read())
+        out = json.loads(resp.get("response", "{}"))
+        nr = int(out.get("nr", 0))
+        if not 1 <= nr <= len(cands):
+            return None
+        orig, q = cands[nr - 1], (out.get("quote") or "").strip().strip('"„“”')
+        log(f"Lokale KI wählt #{nr}: {orig}")
+        # Sicherheitsnetz: geglättete Fassung nur, wenn sie inhaltlich beim Original bleibt
+        if q and 40 <= len(q) <= 180 and _overlap(q, orig) >= 0.8:
+            return q
+        return _clean(orig)
+    except Exception as e:
+        log("Lokale KI Fehler:", e); return None
 
 def pick_quote(vid, ep):
     transcript = get_transcript(vid)
@@ -337,7 +443,10 @@ def pick_quote(vid, ep):
         q = _gemini_quote(transcript, ep)
         if q:
             return q
-    return heuristic_quote(transcript, ep)  # gratis, ohne Key
+    q = local_llm_quote(transcript, ep)   # gratis, ohne Key – läuft im Runner
+    if q:
+        return q
+    return heuristic_quote(transcript, ep)
 
 def sub1(pattern, repl, text, flags=0):
     new, n = re.subn(pattern, repl, text, count=1, flags=flags)
@@ -352,6 +461,22 @@ def set_quote(doc, quote, guest, num):
     doc = sub1(r'(<blockquote class="quote[^>]*>[\s\S]*?<cite>)[\s\S]*?(</cite>)',
                lambda mm: mm.group(1) + attrib + mm.group(2), doc)
     return doc
+
+def update_llms(nid, num, title, guest):
+    """Neue Folge oben in die Folgenliste von llms.txt (GEO), max. 4 Einträge."""
+    try:
+        txt = open(LLMS, encoding="utf-8").read()
+    except FileNotFoundError:
+        return
+    m = re.search(r"(<!-- FOLGEN:START -->\n)([\s\S]*?)(<!-- FOLGEN:END -->)", txt)
+    if not m or nid in m.group(2):
+        return
+    entry = f"- [Folge #{num}: {title}" + (f" – mit {guest}" if guest else "") + \
+            f"](https://www.youtube.com/watch?v={nid})\n"
+    lines = [entry] + [l + "\n" for l in m.group(2).splitlines() if l.strip()][:3]
+    txt = txt[:m.start(2)] + "".join(lines) + txt[m.end(2):]
+    if os.environ.get("DRY_RUN") != "1":
+        open(LLMS, "w", encoding="utf-8").write(txt)
 
 def finalize(doc, nid, msg):
     if not (doc.strip().startswith("<!DOCTYPE") and nid in doc):
@@ -378,12 +503,19 @@ def main():
     current_id = os.environ.get("SIMULATE_CURRENT_ID") or (m.group(1) if m else None)
     log("Aktuelle Hero-ID:", current_id)
 
+    manual = (os.environ.get("MANUAL_QUOTE") or "").strip().strip('"„“”')
+    if manual:
+        # Zitat von Hand (Workflow-Eingabe „zitat“) für die aktuelle Folge im Hero
+        doc = set_quote(doc, manual, p["guest"], p["num"]) if current_id == ep["id"] else doc
+        finalize(doc, current_id, f"Zitat von Hand gesetzt für Folge #{p['num']}")
+        return
+
     if current_id == ep["id"]:
         # Keine neue Folge – aber evtl. Zitat nachziehen, falls es beim ersten
         # Lauf noch kein Transkript gab und es jetzt verfügbar ist.
         cm = re.search(r'<cite>[\s\S]*?Folge\s*#?(\d+)\s*</cite>', doc)
         cite_num = cm.group(1) if cm else None
-        if cite_num != p["num"]:
+        if cite_num != p["num"] or os.environ.get("FORCE_QUOTE") == "true":
             q = pick_quote(current_id, p)
             if q:
                 doc = set_quote(doc, q, p["guest"], p["num"])
@@ -455,6 +587,7 @@ def main():
     else:
         log("Zitat noch nicht gesetzt – wird an einem der nächsten Läufe automatisch nachgezogen.")
 
+    update_llms(nid, num, p["title"], p["guest"])
     finalize(doc, nid, f"Neue Folge #{num}: {p['title']}")
 
 if __name__ == "__main__":
